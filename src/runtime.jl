@@ -27,7 +27,20 @@ function Base.lock(f::Function, q::Queue)
     end
 end
 
-function Base.fill!(qu::Queue, s::Scheduler, init)
+"""
+
+Read queue from queue.json stored in RemoteHPC config. Useful for when restarting server.
+"""
+function read_queue()
+    qfile = config_path("jobs", "queue.json")
+    tq = JSON3.read(read(qfile, String))
+    full_queue = StructTypes.constructfrom(Dict{String,Job}, tq[:full_queue])
+    current_queue = StructTypes.constructfrom(Dict{String, Job}, tq[:current_queue])
+    # submit_queue = StructTypes.constructfrom(Dict{String, Job}, tq[:submit_queue])
+    return (;full_queue, current_queue)
+end
+    
+function Base.fill!(qu::Queue, scheduler::Scheduler, init)
     qfile = config_path("jobs", "queue.json")
     if init
         if ispath(qfile)
@@ -66,7 +79,7 @@ function Base.fill!(qu::Queue, s::Scheduler, init)
         end
     end
     # Here we check whether the scheduler died while the server was running and try to restart and resubmit   
-    if maybe_scheduler_restart(s)
+    if maybe_scheduler_restart(scheduler)
         lock(qu) do q
             for (d, i) in q.current_queue
                 if ispath(joinpath(d, "job.sh"))
@@ -77,13 +90,14 @@ function Base.fill!(qu::Queue, s::Scheduler, init)
             end
         end
     else
-        squeue = queue(s)
+    # updating queue
+        squeue = queue(scheduler)
         lock(qu) do q
             for (d, i) in q.current_queue
                 if haskey(squeue, d)
                     state = pop!(squeue, d)[2]
                 else
-                    state = jobstate(s, i.id)
+                    state = jobstate(scheduler, i.id)
                 end
                 if in_queue(state)
                     delete!(q.full_queue, d)
@@ -121,10 +135,11 @@ const SLEEP_TIME = Ref(5.0)
 
 function main_loop(s::ServerData)
     fill!(s.queue, s.server.scheduler, true)
-    # Used to identify if multiple servers are running in order to selfdestruct 
-    # log_mtimes = mtime.(joinpath.((config_path("logs/runtimes/"),), readdir(config_path("logs/runtimes/"))))
-    t = Threads.@spawn while !s.stop
+    
+    # Queue update task
+    t_writequeue = Threads.@spawn while !s.stop
         try
+            @debugv 3 "Running queue update task" logtype=RuntimeLog
             fill!(s.queue, s.server.scheduler, false)
             JSON3.write(config_path("jobs", "queue.json"), s.queue.info)
         catch e
@@ -132,28 +147,33 @@ function main_loop(s::ServerData)
         end
         sleep(s.sleep_time)
     end
-    Threads.@spawn while !s.stop
+    
+    # Job submission handling task
+    t_submit = Threads.@spawn while !s.stop
         try
+            @debugv 3 "Running job submission task" logtype=RuntimeLog
             handle_job_submission!(s)
         catch e
             log_error(e, logtype = RuntimeLog)
         end
         sleep(s.sleep_time)
     end
+    
     while !s.stop
-        # monitor_issues(log_mtimes)
         try
             log_info(s)
         catch e
             log_error(e, logtype = RuntimeLog)
         end
         if ispath(config_path("self_destruct"))
-            @debug "self_destruct found, self destructing..."
+            @debug "self_destruct found, self destructing..." logtype=RuntimeLog
             exit()
         end
         sleep(s.sleep_time)
     end
-    fetch(t)
+    
+    fetch(t_writequeue)
+    fetch(t_submit)  # Make sure we wait for the submission handler to finish
     return JSON3.write(config_path("jobs", "queue.json"), s.queue.info)
 end
 
@@ -167,7 +187,7 @@ function log_info(s::ServerData)
     s.requests_per_second = curreq / dt
     s.total_requests += curreq
     
-    @debugv 0 "current_queue: $(length(s.queue.info.current_queue)) - submit_queue: $(length(s.queue.info.submit_queue))" logtype=RuntimeLog
+    # @debugv 0 "current_queue: $(length(s.queue.info.current_queue)) - submit_queue: $(length(s.queue.info.submit_queue))" logtype=RuntimeLog
     @debugv 0 "total requests: $(s.total_requests) - r/s: $(s.requests_per_second)" logtype=RESTLog 
 end
 
@@ -187,45 +207,40 @@ function monitor_issues(log_mtimes)
 end
 
 function handle_job_submission!(s::ServerData)
-    @debugv 2 "Submitting jobs" logtype=RuntimeLog
-    to_submit = s.queue.info.submit_queue
-    njobs = length(s.queue.info.current_queue)
+    @debugv 2 "Handling job submissions" logtype=RuntimeLog
+    
+    # Process channel items
     while !isempty(s.submit_channel)
-        jobdir,priority = take!(s.submit_channel)
-        to_submit[jobdir] = priority
+        jobdir, priority = take!(s.submit_channel)
+        @debugv 0 "Moving from channel to submit_queue: $jobdir" logtype=RuntimeLog
+        s.queue.info.submit_queue[jobdir] = priority
     end
-    n_submit = min(s.server.max_concurrent_jobs - njobs, length(to_submit))
+    
+    # Try to submit jobs
+    n_submit = min(s.server.max_concurrent_jobs - length(s.queue.info.current_queue), 
+                  length(s.queue.info.submit_queue))
+    
     submitted = 0
     for i in 1:n_submit
-        job_dir, priority = dequeue_pair!(to_submit)
-        if ispath(job_dir)
-            curtries = 0
-            while -1 < curtries < 3
-                try
-                    id = submit(s.server.scheduler, job_dir)
-                    @debugv 2 "Submitting Job: $(id)@$(job_dir)" logtype=RuntimeLog
-                    lock(s.queue) do q
-                        return q.current_queue[job_dir] = Job(id, Pending)
-                    end
-                    curtries = -1
-                    submitted += 1
-                catch e
-                    curtries += 1
-                    sleep(s.sleep_time)
-                    lock(s.queue) do q
-                        q.full_queue[job_dir] = Job(-1, SubmissionError)
-                    end
-                    
-                    with_logger(FileLogger(joinpath(job_dir, "submission.err"), append=true)) do
-                        log_error(e)
-                    end
-                end
+        job_dir, priority = dequeue_pair!(s.queue.info.submit_queue)
+        @debugv 0 "Attempting to submit: $job_dir" logtype=RuntimeLog
+        
+        if !ispath(job_dir)
+            @warnv 0 "Directory not found: $job_dir" logtype=RuntimeLog
+            continue
+        end
+        
+        try
+            id = submit(s.server.scheduler, job_dir)
+            lock(s.queue) do q
+                q.current_queue[job_dir] = Job(id, Pending)
+                delete!(q.full_queue, job_dir)
             end
-            if curtries != -1
-                to_submit[job_dir] = (priority[1] - 1, priority[2])
-            end
-        else
-            @warnv 2 "Submission job at dir: $job_dir is not a directory." logtype=RuntimeLog
+            @debugv 0 "Successfully submitted: $job_dir (ID: $id)" logtype=RuntimeLog
+            submitted += 1
+        catch e
+            @warnv 0 "Submission failed for $job_dir: $(sprint(showerror, e))" logtype=RuntimeLog
+            s.queue.info.submit_queue[job_dir] = (priority[1] - 1, priority[2])
         end
     end
     @debugv 2 "Submitted $submitted jobs" logtype=RuntimeLog
@@ -263,6 +278,8 @@ function AuthHandler(handler, user_uuid::UUID)
     return function f(req)
         if HTTP.hasheader(req, "USER-UUID")
             uuid = HTTP.header(req, "USER-UUID")
+
+            @debug "uuid of request: $uuid, uuid of server: $user_uuid"
             if UUID(uuid) == user_uuid
                 t = ThreadPools.spawnbg() do 
                     return handler(req)
@@ -342,6 +359,7 @@ end
 function check_connections!(server_data::ServerData, args...; kwargs...)
     all_servers = load(Server(""))
     
+    # delete unconfigured servers
     for k in filter(x-> !(x in all_servers), keys(server_data.connections))
         delete!(server_data.connections, k)
     end
@@ -357,7 +375,75 @@ function check_connections!(server_data::ServerData, args...; kwargs...)
     
     return conn
 end
+
+
+"""
+    $(SIGNATURES)
+Check if the ssh port forwarding tunnel to server s is still alive using command `nc`.
+"""
+function check_tunnel(s::Server)
+    check_tunnel(s.port)
+end
+
+function check_tunnel(port::Int64)
+    try
+        r = run(Cmd(`nc -z localhost $port`))
+        return iszero(r.exitcode)
+    catch
+        return false
+    end
+end
+
+"""
+Check the status of ssh tunnel forwarding to all configured servers
+"""
+function check_tunnels()
+    all_servers = load(Server(""))
+    host = gethostname()
+   
+    status = Dict{String, Any}()
+    for sn in all_servers
+        # skip local server
+        if sn == host
+            continue
+        end
     
+        server = Server(sn)
+        res = check_tunnel(server.port)
+        status[sn] = res
+    end
+    return status
+end
+
+"""
+Rebuild dead ssh tunnels based on local ports stored in the config and remote ports stored
+on servers. The status of the tunnels are decieded by `check_tunnels()`
+This is necessary since ssh tunnels are frequently destroyed. 
+"""
+function maybe_revive_tunnels()
+    status = check_tunnels()
+    # TODO will maintain ssh tunnel for all configured servers
+    # this can block the port even when the server is not running on the remote
+    # machine, alternatively we can connect ssh tunnel to only the "intended"
+    # servers, which may need additional configurations.
+    # TODO check autossh https://github.com/Autossh/autossh
+    for sn in keys(status)
+        # skip established tunnels
+        if status[sn]
+            continue
+        end
+        @debug "Attempt to rebuild tunnel to server $sn." logtype=RuntimeLog
+        s = Server(sn)
+        config = load_config(s)
+        cmd = Cmd(`ssh -o ExitOnForwardFailure=yes -o ServerAliveInterval=60 -N -L $(s.port):localhost:$(config.port) $(ssh_string(s))`)
+        try
+            process = run(cmd; wait=false)
+        catch e
+            log_error(e)
+        end
+    end
+end
+
 function julia_main(;verbose=0, kwargs...)::Cint
     logger = TimestampLogger(TeeLogger(HTTPLogger(),
                                    NotHTTPLogger(TeeLogger(RESTLogger(),
@@ -378,22 +464,25 @@ function julia_main(;verbose=0, kwargs...)::Cint
                 setup_job_api!(server_data)
                 setup_database_api!()
 
+                # ssh portforwarding may crash
+                # this periodically checks the ssh tunnels and revive them
                 connection_task = Threads.@spawn @stoppable server_data.stop begin
-                    @debug "Checking Connections" logtype=RuntimeLog
+                    @debug "Checking Tunnels" logtype=RuntimeLog
                     try
-                        check_connections!(server_data, false)
+                        t = time()
                         while true
-                            t = time()
-                            check_connections!(server_data, false)
-                            sleep_t = 5 - (time() - t)
-                            if sleep_t > 0
-                                sleep(sleep_t)
+                            if time() - t > server_data.sleep_time
+                                t = time()
+                                maybe_revive_tunnels()
+                            else
+                                sleep(10)
                             end
                         end
                     catch e
                         log_error(e)
                     end
                 end
+
                 
                 @debug "Starting main loop" logtype=RuntimeLog
 

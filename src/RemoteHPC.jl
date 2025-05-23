@@ -12,13 +12,14 @@ using JSON3
 using UUIDs
 using Dates
 using ProgressMeter
-using SnoopPrecompile
+using PrecompileTools
 using Base: @kwdef
 using Pkg
 using InteractiveUtils
 using BinaryTraits
 using DataStructures
 using Oxygen
+using DocStringExtensions
 
 const CONFIG_DIR = occursin("cache", first(Base.DEPOT_PATH)) ?
                    abspath(Base.DEPOT_PATH[2], "config", "RemoteHPC") :
@@ -50,9 +51,9 @@ include("client.jl")
 include("io.jl")
 
 
-@precompile_all_calls begin
+@compile_workload begin
     s = local_server()
-    isalive(local_server())
+    # isalive(local_server())
     t = "asdfe"
     t2 = "edfasdf"
     e = Exec(; name = t2, path = "srun")
@@ -71,7 +72,7 @@ end
 
 export Server, start, restart, local_server, isalive, load, save, submit, abort, state, configure, priority!, check_connections
 export Calculation, Environment, Exec, HQ, Slurm, Bash
-export exec
+export check_tunnels, exec, queue
 
 
 function __init__()

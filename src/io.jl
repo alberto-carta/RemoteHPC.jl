@@ -77,8 +77,9 @@ function Base.write(io::IO, job_info::Tuple, sched::Scheduler)
             end
         end
     end
-    if !isempty(modules)
-        write(io, "module load $(join(modules, " "))\n")
+    # break into different lines to make sure modules are loaded sequentially
+    map(modules) do m
+        write(io, "module load $(m)\n")
     end
 
     for c in calcs

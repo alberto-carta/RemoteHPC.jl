@@ -1,4 +1,9 @@
 @enum JobState BootFail Pending Running Completed Cancelled Deadline Failed NodeFail OutOfMemory Preempted Requeued Resizing Revoked Suspended Timeout Submitted Unknown PostProcessing Saved Configuring Completing SubmissionError
+# lookup table
+inst = instances(JobState)
+strs = string.(inst)
+state2str = Dict(zip(inst, strs))
+str2state = Dict(zip(strs, inst))
 
 """
     Exec(;name::String = "",

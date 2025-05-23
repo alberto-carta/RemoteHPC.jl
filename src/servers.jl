@@ -450,6 +450,16 @@ function Base.rm(s::Server, p::String)
         return nothing
     end
 end
+
+function Base.mv(s::Server, src::AbstractString, dst::AbstractString; force::Bool=true)
+    if islocal(s)
+        mv(src, dst; force=force)
+    else
+        HTTP.post(s, URI(path="/mv/"), query=Dict("src"=>src, "dst"=>dst, "force"=>force))
+        return dst
+    end
+end
+
 function Base.read(s::Server, path::String, type = nothing)
     if islocal(s)
         return type === nothing ? read(path) : read(path, type)
@@ -459,6 +469,7 @@ function Base.read(s::Server, path::String, type = nothing)
         return type === nothing ? t : type(t)
     end
 end
+
 function Base.write(s::Server, path::String, v)
     if islocal(s)
         write(path, v)
@@ -467,20 +478,27 @@ function Base.write(s::Server, path::String, v)
         return JSON3.read(resp.body, Int)
     end
 end
+
 function Base.mkpath(s::Server, dir)
     HTTP.post(s, URI(path="/mkpath/", query=Dict("path" => dir)))
     return dir
 end
+
 function Base.cp(s::Server, src, dst)
     HTTP.post(s, URI(path="/cp/"), (src, dst))
     return dst
 end
+
 
 parse_config(config) = JSON3.read(config, Server)
 read_config(config_file) = parse_config(read(config_file, String))
 
 config_path(s::Server, p...) = joinpath(depot_path(s), "config", "RemoteHPC", p...)
 
+"""
+Load configuration on remote server regardless of if that server is alive.
+Will excute through ssh.
+"""
 function load_config(username, domain, conf_path)
     hostname = gethostname(username, domain)
     if domain == "localhost"
@@ -571,17 +589,28 @@ function destroy_tunnel(s)
     end
 end
 
+"""
+    construct_tunnel
+
+    Find free port and open ssh local port forwarding on that port.
+    See the trick in `find_free_port` in RemoteREPL. 
+    https://github.com/JuliaWeb/RemoteREPL.jl/blob/main/src/tunnels.jl
+   
+"""
+
 function construct_tunnel(s, remote_port)
     if Sys.which("ssh") === nothing
         OpenSSH_jll.ssh() do ssh_exec
             port, serv = listenany(Sockets.localhost, 0)
             close(serv)
+            @debug "Connecting SSH tunnel with OpenSSH_jil to remote $(ssh_string(s)) on local port $port"
             run(Cmd(`$ssh_exec -o ExitOnForwardFailure=yes -o ServerAliveInterval=60 -N -L $port:localhost:$remote_port $(ssh_string(s))`); wait=false)
             return port
         end
     else
         port, serv = listenany(Sockets.localhost, 0)
         close(serv)
+        @debug "Connecting SSH tunnel with ssh to remote $(ssh_string(s)) on local port $port"
         cmd = Cmd(`ssh -o ExitOnForwardFailure=yes -o ServerAliveInterval=60 -N -L $port:localhost:$remote_port $(ssh_string(s))`)
         run(cmd; wait=false)
         return port
@@ -615,7 +644,7 @@ function pull(server::Server, remote::String, loc::String)
                 error("$stderr")
             end
         else
-            write(loc, read(server, remote))
+            write(path, read(server, remote))
         end
             
     end

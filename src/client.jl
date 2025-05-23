@@ -1,7 +1,8 @@
 """
     start(s::Server)
 
-Launches the daemon process on  the host [`Server`](@ref) `s`.
+Launches the daemon process on the host [`Server`](@ref) `s`. Note s may be modified, so always
+use s = start(s).
 """
 function start(s::Server; verbosity=0)
 
@@ -10,7 +11,8 @@ function start(s::Server; verbosity=0)
     steps = ["Verifying that local server is running",
              "Verifying that the server isn't already alive",
              "Starting server",
-             "Waiting for server connection"]
+             "Waiting for server connection",
+             "Finishing up"]
     
     StepSpinner(title, steps) do spinner
         
@@ -22,9 +24,10 @@ function start(s::Server; verbosity=0)
                 finish!(spinner, ErrorException("Couldn't start local server."))
             end
         end
+
         push!(spinner, "local server running")
 
-        next!(spinner)
+        next!(spinner) # step 2
         
         alive = isalive(s) || (!islocal(s) && get(JSON3.read(check_connections(names=[s.name]).body), Symbol(s.name), false))
         if alive
@@ -33,7 +36,7 @@ function start(s::Server; verbosity=0)
             return
         end
 
-        next!(spinner)
+        next!(spinner) # step 3
         
         hostname  = gethostname(s)
         conf_path = config_path(s)
@@ -83,12 +86,13 @@ function start(s::Server; verbosity=0)
             return curtime
         end
         firstime = checktime()
+        @debug "server startup: last modified time of config file $(checktime())"
 
         p = "$(conf_path)/$hostname/logs/errors.log"
         scrpt = "using RemoteHPC; RemoteHPC.julia_main(verbose=$(verbosity))"
         
         if s.domain != "localhost"
-            julia_cmd = replace("""$(s.julia_exec) --project=$(conf_path) --startup-file=no -t 10 -e "using RemoteHPC; RemoteHPC.julia_main(verbose=$(verbosity))" &> $p""",
+            julia_cmd = replace("""export OPENBLAS_NUM_THREADS=1; $(s.julia_exec) --project=$(conf_path) --startup-file=no -t 10 -e "using RemoteHPC; RemoteHPC.julia_main(verbose=$(verbosity))" 2&>1 $p""",
                                 "'" => "")
             if Sys.which("ssh") === nothing
                 OpenSSH_jll.ssh() do ssh_exec
@@ -108,6 +112,7 @@ function start(s::Server; verbosity=0)
         push!(spinner, "Waiting for server bootup")
         
         while checktime() <= firstime && retries < 60
+            @debug "server startup: last modified time of config file $(checktime())"
             retries += 1
             sleep(1)
         end
@@ -116,13 +121,15 @@ function start(s::Server; verbosity=0)
             finish!(spinner, ErrorException("Something went wrong starting the server."))
         end
         
-        next!(spinner)
+        next!(spinner) #step 4
         
         cfg = load_config(s)
         s.port = cfg.port
         s.uuid = cfg.uuid
         
         save(s)
+
+        next!(spinner) #step 5
 
         retries = 0
         
@@ -134,8 +141,11 @@ function start(s::Server; verbosity=0)
             LOCAL_SERVER[] = local_server()
             
         else
+            # NOTE local port will be changed here and save to config file
             check_connections(; names=[s.name])
+            s = load(s)
             while !isalive(s) && retries < 60
+                retries += 1
                 sleep(0.1)
             end
         end
@@ -182,10 +192,10 @@ function update_config(s::Server)
 end
 
 """
-    isalive(s::Server)
+    $(SIGNATURES)
 
-Will try to fetch some data from `s`. If the server is not running this will fail and
-the return is `false`.
+Check if server s is pingable. isalive return true if both the ssh tunnel and remote server
+is working.
 """
 function isalive(s::Server)
     if islocal(s)
@@ -197,18 +207,35 @@ function isalive(s::Server)
             return false
         end
     else
-        if !isalive(LOCAL_SERVER[])
-            error("Local server not running. Use `start(local_server())` first.")
-        end
-        return JSON3.read(HTTP.get(LOCAL_SERVER[], URI(path="/isalive/$(s.name)"); connect_timeout = 2, retries = 2).body, Bool)
+        return JSON3.read(
+            HTTP.get(LOCAL_SERVER[], URI(path="/isalive/$(s.name)"); connect_timeout = 2, retries = 2).body,
+            Bool
+        )
     end
 end
+
+"""
+    $(SIGNATURES)
+
+Check if the port of the ssh tunnel to the server is listening.
+"""
+function islistening(s::Server)
+    cmd = pipeline(pipeline(`echo -e '\x1dclose\x0d'`, `telnet localhost $(s.port)`); stdout=devnull)
+    try
+        p = run(cmd)
+        return iszero(p.processes[2].exitcode)
+    catch
+        return false
+    end
+end
+
 
 function check_connections(; names=[])
     if isempty(names)
         return HTTP.put(LOCAL_SERVER[], URI(path="/server/check_connections"), timeout = 60)
     else
         for n in names
+            # put will create check_connections on the server if it doesn't exist
             return HTTP.put(LOCAL_SERVER[], URI(path="/server/check_connections/$n"), timeout = 60)
         end
     end
@@ -238,6 +265,31 @@ function load(s::Server, state::JobState)
     resp = HTTP.get(s, URI(path="/jobs/state/"), state)
     return JSON3.read(resp.body, Vector{String})
 end
+
+"""
+    $(SIGNATURES)
+
+Show queue information on server.
+"""
+function queue(s::Server; io=stdout)
+    sched_type = s.scheduler.type
+    resp = HTTP.get(s, URI(path="/jobs/queue"))
+    q = JSON3.read(resp.body, Vector{String})
+        
+    # pendings = sum([v[2] == JobState(1) for v in values(q)])
+    # runnings = sum([v[2] == JobState(2) for v in values(q)])
+    full = parse(Int, q[1])
+    runnings = parse(Int, q[2])
+    submits = parse(Int, q[3])
+    println(io, "$(sched_type) scheduler on server $(s.name)")
+    println(io, "Total jobs: $(full)")
+    println(io, "Jobs running: $(runnings)")
+    println(io, "Jobs submitted: $(submits)")
+end
+
+running(s::Server) = load(s, Running)
+pending(s::Server) = load(s, Pending)
+failed(s::Server) = load(s, Failed)
 
 function submit(s::Server, dir::AbstractString, priority=DEFAULT_PRIORITY)
     adir = abspath(s, dir)

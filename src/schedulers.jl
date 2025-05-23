@@ -81,7 +81,39 @@ function parse_params(sched::Scheduler, preamble::String)
 end
 
 maybe_scheduler_restart(::Bash) = false
-queue(::Bash) = Dict()
+
+function queue(::Bash)
+    return Dict()
+    # TODO this is not working with how queue is updated
+    # joblog = config_path("jobs")
+    # qd = JSON3.read(read(joinpath(joblog, "queue.json"), String))
+    # return merge(
+    #     parse_submit_queue(qd.submit_queue),
+    #     parse_current_queue(qd.current_queue),
+    #     # not needed for now
+    #     # d = parse_queue(qd.full_queue)
+    # )
+end
+
+function parse_submit_queue(qdict)
+    d = Dict{String, Tuple{Int64, JobState}}()
+    for k in keys(qdict)
+        v = qdict[k]
+        priority, _ = v[1], v[2]
+        d[string(k)] = (priority, Pending)
+    end
+    return d
+end
+
+function parse_current_queue(qdict)
+    d = Dict{String, Tuple{Int64, JobState}}()
+    for k in keys(qdict)
+        v = qdict[k]
+        id, state = Int64(v.id), str2state[v.state]
+        d[string(k)] = (id, state)
+    end
+    return d
+end
 
 function jobstate(::Bash, id::Int)
     out = Pipe()
